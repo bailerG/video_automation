@@ -2,8 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
+	"google.golang.org/api/drive/v3"
+	"google.golang.org/api/option"
 	"io"
 	"log"
 	"net/http"
@@ -23,7 +29,6 @@ var (
 	httpClient       = &http.Client{Timeout: 30 * time.Second}
 )
 
-// Main function - entry point
 func main() {
 	fmt.Println("🎬 TikTok Video Creation Automation")
 	fmt.Println("===================================")
@@ -39,10 +44,12 @@ func main() {
 	// topic = "machine learning breakthroughs" // Uncomment to change topic
 
 	// Start the automation flow
-	Trigger()
+	if err := Trigger(); err != nil {
+		log.Printf("Error running automation: %v", err)
+		return
+	}
 
 	fmt.Println("\n✨ Automation flow completed!")
-	fmt.Println("In a production environment, this would run every hour via scheduler.")
 }
 
 // Initialize configuration
@@ -70,11 +77,18 @@ func makeHTTPRequest(method, url string, headers map[string]string, body interfa
 	var reqBody io.Reader
 
 	if body != nil {
-		jsonBody, err := json.Marshal(body)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal request body: %v", err)
+		switch b := body.(type) {
+		case []byte:
+			reqBody = bytes.NewBuffer(b)
+		case string:
+			reqBody = strings.NewReader(b)
+		default:
+			jsonBody, err := json.Marshal(body)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal request body: %v", err)
+			}
+			reqBody = bytes.NewBuffer(jsonBody)
 		}
-		reqBody = bytes.NewBuffer(jsonBody)
 	}
 
 	req, err := http.NewRequest(method, url, reqBody)
@@ -82,7 +96,6 @@ func makeHTTPRequest(method, url string, headers map[string]string, body interfa
 		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 
-	// Set headers
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
@@ -105,21 +118,97 @@ func makeHTTPRequest(method, url string, headers map[string]string, body interfa
 	return responseBody, nil
 }
 
+// getDriveService returns an authenticated Google Drive service
+func getDriveService() (*drive.Service, error) {
+	ctx := context.Background()
+	b, err := os.ReadFile("credentials.json")
+	if err != nil {
+		return nil, fmt.Errorf("unable to read client secret file: %v", err)
+	}
+
+	config, err := google.ConfigFromJSON(b, drive.DriveFileScope)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse client secret file to config: %v", err)
+	}
+
+	tokFile := "token.json"
+	tok, err := tokenFromFile(tokFile)
+	if err != nil {
+		tok, err = getTokenFromWeb(config)
+		if err != nil {
+			return nil, err
+		}
+		if err2 := saveToken(tokFile, tok); err2 != nil {
+			return nil, err2
+		}
+	}
+
+	client := config.Client(ctx, tok)
+	return drive.NewService(ctx, option.WithHTTPClient(client))
+}
+
+// tokenFromFile retrieves a token from a local file.
+func tokenFromFile(file string) (*oauth2.Token, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	tok := &oauth2.Token{}
+	err = json.NewDecoder(f).Decode(tok)
+	return tok, err
+}
+
+// getTokenFromWeb requests a token from the web, then returns the retrieved token.
+func getTokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
+	url := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
+	fmt.Printf("Go to the following link in your browser then type the authorization code: \n%v\n", url)
+
+	var authCode string
+	if _, err := fmt.Scan(&authCode); err != nil {
+		return nil, fmt.Errorf("unable to read authorization code: %v", err)
+	}
+
+	tok, err := config.Exchange(context.Background(), authCode)
+	if err != nil {
+		return nil, fmt.Errorf("unable to retrieve token from web: %v", err)
+	}
+	return tok, nil
+}
+
+// saveToken saves a token to a file path.
+func saveToken(path string, token *oauth2.Token) error {
+	fmt.Printf("Saving credential file to: %s\n", path)
+	f, err := os.Create(path)
+	if err != nil {
+		log.Fatalf("unable to cache oauth token: %v", err)
+	}
+	defer f.Close()
+	if err = json.NewEncoder(f).Encode(token); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Trigger function - starts the automation flow
-func Trigger() {
+func Trigger() error {
 	// Starts a new generation every 3 hours
 	for true {
 		fmt.Println("🚀 Starting video creation automation flow...")
 		fmt.Printf("⏰ Scheduled trigger activated at %s\n", time.Now().Format("2006-01-02 15:04:05"))
 
-		GenStory()
+		if err := GenStory(); err != nil {
+			return err
+		}
 
 		time.Sleep(3 * time.Hour)
 	}
+
+	return nil
 }
 
 // GenStory function - generates TikTok script using Gemini
-func GenStory() {
+func GenStory() error {
 	fmt.Println("📝 Generating TikTok story...")
 
 	prompt := fmt.Sprintf("Write a 60-second TikTok script that hooks viewers in the first 3 seconds and tells a compelling, shareable story about %s.", topic)
@@ -154,29 +243,25 @@ func GenStory() {
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-latest:generateContent?key=%s", config.GeminiAPIKey)
 	responseBody, err := makeHTTPRequest("POST", url, headers, requestBody)
 	if err != nil {
-		log.Printf("❌ Failed to generate story: %v", err)
-		// In production, you might want to retry or use a fallback
-		return
+		return fmt.Errorf("failed to generate story: %v", err)
 	}
 
 	var response GeminiResponse
-	if err := json.Unmarshal(responseBody, &response); err != nil {
-		log.Printf("❌ Failed to parse Gemini response: %v", err)
-		return
+	if err = json.Unmarshal(responseBody, &response); err != nil {
+		return fmt.Errorf("failed to parse Gemini response: %v", err)
 	}
 
 	if len(response.Candidates) == 0 || len(response.Candidates[0].Content.Parts) == 0 {
-		log.Printf("❌ No story generated")
-		return
+		return fmt.Errorf("no story generated")
 	}
 
 	currentStory = response.Candidates[0].Content.Parts[0].Text
 	fmt.Printf("✅ Generated story: %s\n", currentStory[:100]+"...")
-	QAStory()
+	return QAStory(currentStory)
 }
 
 // QAStory function - evaluates the story quality
-func QAStory() {
+func QAStory(currentStory string) error {
 	fmt.Println("🔍 Evaluating story quality...")
 
 	prompt := fmt.Sprintf("Evaluate the following TikTok script for virality: %s. Score 1-10 and suggest improvements if under 8.", currentStory)
@@ -211,19 +296,16 @@ func QAStory() {
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-latest:generateContent?key=%s", config.GeminiAPIKey)
 	responseBody, err := makeHTTPRequest("POST", url, headers, requestBody)
 	if err != nil {
-		log.Printf("❌ Failed to evaluate story: %v", err)
-		return
+		return fmt.Errorf("failed to evaluate story: %v", err)
 	}
 
 	var response GeminiResponse
-	if err := json.Unmarshal(responseBody, &response); err != nil {
-		log.Printf("❌ Failed to parse QA response: %v", err)
-		return
+	if err = json.Unmarshal(responseBody, &response); err != nil {
+		return fmt.Errorf("failed to parse QA response: %v", err)
 	}
 
 	if len(response.Candidates) == 0 || len(response.Candidates[0].Content.Parts) == 0 {
-		log.Printf("❌ No QA response received")
-		return
+		return fmt.Errorf("no QA response received")
 	}
 
 	qaResponse := response.Candidates[0].Content.Parts[0].Text
@@ -238,16 +320,18 @@ func QAStory() {
 		strings.Contains(qaResponse, "Score: 6") ||
 		strings.Contains(qaResponse, "Score: 7") {
 		fmt.Println("❌ Score too low, regenerating story...")
-		GenStory() // Loop back if score is too low
-		return
+		if err = GenStory(); err != nil {
+			return fmt.Errorf("failed to regenerate story: %v", err)
+		}
+		return nil
 	}
 
 	fmt.Println("✅ Story quality approved, proceeding to TTS...")
-	MakeTTS()
+	return MakeTTS(currentStory)
 }
 
 // MakeTTS function - converts text to speech
-func MakeTTS() {
+func MakeTTS(currentStory string) error {
 	fmt.Println("🎤 Converting text to speech...")
 
 	// Define the ElevenLabs API endpoint
@@ -265,8 +349,7 @@ func MakeTTS() {
 	// Marshal the request body to JSON
 	requestBody, err := json.Marshal(ttsRequest)
 	if err != nil {
-		log.Printf("❌ Failed to marshal TTS request: %v", err)
-		return
+		return fmt.Errorf("failed to marshal TTS request: %v", err)
 	}
 
 	// Set up headers
@@ -278,25 +361,24 @@ func MakeTTS() {
 	// Make the HTTP request
 	responseBody, err := makeHTTPRequest("POST", apiURL, headers, requestBody)
 	if err != nil {
-		log.Printf("❌ Failed to convert text to speech: %v", err)
-		return
+		return fmt.Errorf("failed to convert text to speech: %v", err)
 	}
 
 	// Parse the response
 	var response TTSResponse
-	if err := json.Unmarshal(responseBody, &response); err != nil {
-		log.Printf("❌ Failed to parse TTS response: %v", err)
-		return
+	if err = json.Unmarshal(responseBody, &response); err != nil {
+		return fmt.Errorf("failed to parse TTS response: %v", err)
 	}
 
-	currentAudioURL = response.AudioURL
-	fmt.Printf("✅ TTS completed. Audio URL: %s\n", currentAudioURL)
-
-	QAVO()
+	fmt.Printf("✅ TTS completed.")
+	if false {
+		QAVO()
+	}
+	return FetchVideo(response.Audio)
 }
 
 // QAVO function - quality assurance for voiceover
-func QAVO() {
+func QAVO() error {
 	fmt.Println("🎧 Checking voiceover quality...")
 
 	prompt := fmt.Sprintf("Transcribe and check clarity of this voiceover. Return 'OK' or suggest fixes: %s", currentAudioURL)
@@ -332,18 +414,18 @@ func QAVO() {
 	responseBody, err := makeHTTPRequest("POST", url, headers, requestBody)
 	if err != nil {
 		log.Printf("❌ Failed to check audio quality: %v", err)
-		return
+		return err
 	}
 
 	var response GeminiResponse
-	if err := json.Unmarshal(responseBody, &response); err != nil {
+	if err = json.Unmarshal(responseBody, &response); err != nil {
 		log.Printf("❌ Failed to parse audio QA response: %v", err)
-		return
+		return err
 	}
 
 	if len(response.Candidates) == 0 || len(response.Candidates[0].Content.Parts) == 0 {
 		log.Printf("❌ No audio QA response received")
-		return
+		return errors.New("no audio QA response received")
 	}
 
 	qaResponse := response.Candidates[0].Content.Parts[0].Text
@@ -352,49 +434,42 @@ func QAVO() {
 	// Check if response contains suggestions for fixes
 	if strings.Contains(strings.ToLower(qaResponse), "suggest") {
 		fmt.Println("❌ Audio quality issues detected, regenerating TTS...")
-		MakeTTS() // Loop back if audio needs fixes
-		return
+		if err = MakeTTS(currentStory); err != nil {
+			return err
+		} // Loop back if audio needs fixes
+		return nil
 	}
 
 	fmt.Println("✅ Audio quality approved, fetching video...")
-	FetchVideo()
+	return FetchVideo(nil)
 }
 
-// FetchVideo function - retrieves raw video from Google Drive
-func FetchVideo() {
-	fmt.Println("📹 Fetching raw video from Google Drive...")
+// FetchVideo function - retrieves raw video from Google Drive using Drive API
+func FetchVideo(audioFile []byte) error {
+	fmt.Println("📹 Fetching raw video from Google Drive (using Drive API)...")
 
-	url := fmt.Sprintf("https://www.googleapis.com/drive/v3/files/%s?fields=id,name,webContentLink&key=%s",
-		config.RawVideoFileID, config.GoogleDriveAPIKey)
-
-	headers := map[string]string{
-		"Authorization": "Bearer " + config.GoogleDriveAPIKey,
-	}
-
-	responseBody, err := makeHTTPRequest("GET", url, headers, nil)
+	driveService, err := getDriveService()
 	if err != nil {
-		log.Printf("❌ Failed to fetch video from Google Drive: %v", err)
-		return
+		return fmt.Errorf("failed to create Drive service: %v", err)
 	}
 
-	var response GoogleDriveResponse
-	if err := json.Unmarshal(responseBody, &response); err != nil {
-		log.Printf("❌ Failed to parse Google Drive response: %v", err)
-		return
+	file, err := driveService.Files.Get(config.RawVideoFileID).Fields("id", "name", "webContentLink").Do()
+	if err != nil {
+		return fmt.Errorf("failed to fetch video from Google Drive: %v", err)
 	}
 
-	currentVideoURL = response.WebContentLink
-	fmt.Printf("✅ Video fetched successfully: %s\n", currentVideoURL)
-	MergeAV()
+	videoFile, err := file.VideoMediaMetadata.MarshalJSON()
+	fmt.Printf("✅ Video fetched successfully")
+	return MergeAV(audioFile, videoFile)
 }
 
 // MergeAV function - merges audio and video
-func MergeAV() {
+func MergeAV(audioFile []byte, videoFile []byte) error {
 	fmt.Println("🔧 Merging audio and video...")
 
 	requestBody := MergeRequest{
-		VideoURL:    currentVideoURL,
-		AudioURL:    currentAudioURL,
+		Video:       audioFile,
+		Audio:       videoFile,
 		StartOffset: 0,
 	}
 
@@ -405,26 +480,23 @@ func MergeAV() {
 
 	responseBody, err := makeHTTPRequest("POST", config.MergeServiceURL+"/merge", headers, requestBody)
 	if err != nil {
-		log.Printf("❌ Failed to merge audio and video: %v", err)
-		return
+		return fmt.Errorf("failed to merge audio and video: %v", err)
 	}
 
 	var response MergeResponse
-	if err := json.Unmarshal(responseBody, &response); err != nil {
-		log.Printf("❌ Failed to parse merge response: %v", err)
-		return
+	if err = json.Unmarshal(responseBody, &response); err != nil {
+		return fmt.Errorf("failed to parse merge response: %v", err)
 	}
 
-	currentMergedURL = response.OutputURL
-	fmt.Printf("✅ Audio/Video merge completed: %s\n", currentMergedURL)
-	FinalQA()
+	fmt.Printf("✅ Audio/Video merge completed: %s\n", response.OutputURL)
+	return FinalQA(response.OutputURL)
 }
 
 // FinalQA function - final quality assessment
-func FinalQA() {
+func FinalQA(finalVideoURL string) error {
 	fmt.Println("🎯 Performing final quality assessment...")
 
-	prompt := fmt.Sprintf("Assess the final video here: %s. Check audio levels, pacing, and suggest if it meets TikTok viral standards.", currentMergedURL)
+	prompt := fmt.Sprintf("Assess the final video here: %s. Check audio levels, pacing, and suggest if it meets TikTok viral standards.", finalVideoURL)
 
 	requestBody := GeminiRequest{
 		Contents: []struct {
@@ -456,19 +528,16 @@ func FinalQA() {
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-latest:generateContent?key=%s", config.GeminiAPIKey)
 	responseBody, err := makeHTTPRequest("POST", url, headers, requestBody)
 	if err != nil {
-		log.Printf("❌ Failed to perform final QA: %v", err)
-		return
+		return fmt.Errorf("failed to perform final QA: %v", err)
 	}
 
 	var response GeminiResponse
-	if err := json.Unmarshal(responseBody, &response); err != nil {
-		log.Printf("❌ Failed to parse final QA response: %v", err)
-		return
+	if err = json.Unmarshal(responseBody, &response); err != nil {
+		return fmt.Errorf("failed to parse final QA response: %v", err)
 	}
 
 	if len(response.Candidates) == 0 || len(response.Candidates[0].Content.Parts) == 0 {
-		log.Printf("❌ No final QA response received")
-		return
+		return fmt.Errorf("no final QA response received")
 	}
 
 	qaResponse := response.Candidates[0].Content.Parts[0].Text
@@ -477,46 +546,49 @@ func FinalQA() {
 	// Check if response contains suggestions (indicating issues)
 	if strings.Contains(strings.ToLower(qaResponse), "suggest") {
 		fmt.Println("❌ Final quality issues detected, restarting entire flow...")
-		GenStory() // Restart whole flow if there are issues
-		return
+		if err = GenStory(); err != nil {
+			return err
+		} // Restart whole flow if there are issues
+		return nil
 	}
 
 	fmt.Println("✅ Final quality approved, saving video...")
-	SaveFinal()
+	return SaveFinal(finalVideoURL)
 }
 
-// SaveFinal function - saves the final video to Google Drive
-func SaveFinal() {
-	fmt.Println("💾 Saving final video to Google Drive...")
+// SaveFinal function - saves the final video to Google Drive using Drive API
+func SaveFinal(finalVideoURL string) error {
+	fmt.Println("💾 Saving final video to Google Drive (using Drive API)...")
 
 	fileName := fmt.Sprintf("tiktok_%s.mp4", time.Now().Format("20060102_150405"))
 
-	requestBody := GoogleDriveUploadRequest{
-		FolderID: config.OutputFolderID,
-	}
-	requestBody.File.URL = currentMergedURL
-	requestBody.File.Name = fileName
-
-	headers := map[string]string{
-		"Authorization": "Bearer " + config.GoogleDriveAPIKey,
-		"Content-Type":  "application/json",
-	}
-
-	responseBody, err := makeHTTPRequest("POST", "https://www.googleapis.com/upload/drive/v3/files", headers, requestBody)
+	driveService, err := getDriveService()
 	if err != nil {
-		log.Printf("❌ Failed to save video to Google Drive: %v", err)
-		return
+		return fmt.Errorf("failed to create Drive service: %v", err)
 	}
 
-	var response GoogleDriveResponse
-	if err := json.Unmarshal(responseBody, &response); err != nil {
-		log.Printf("❌ Failed to parse Google Drive upload response: %v", err)
-		return
+	// Download the merged video file
+	resp, err := http.Get(finalVideoURL)
+	if err != nil {
+		return fmt.Errorf("failed to download merged video: %v", err)
+	}
+	defer resp.Body.Close()
+
+	fileMetadata := &drive.File{
+		Name:     fileName,
+		Parents:  []string{config.OutputFolderID},
+		MimeType: "video/mp4",
 	}
 
-	fmt.Printf("✅ Video saved successfully! File ID: %s\n", response.ID)
+	driveFile, err := driveService.Files.Create(fileMetadata).Media(resp.Body).Do()
+	if err != nil {
+		return fmt.Errorf("failed to upload video to Google Drive: %v", err)
+	}
+
+	fmt.Printf("✅ Video saved successfully! File name: %s\n", driveFile.Name)
 	fmt.Printf("🎉 Video creation automation completed successfully!\n")
 	fmt.Printf("📱 Ready for TikTok upload: %s\n", fileName)
+	return nil
 }
 
 // Config Configuration struct for API connections
@@ -559,18 +631,19 @@ type TTSRequest struct {
 }
 
 type TTSResponse struct {
-	AudioURL string `json:"audio_url"`
+	Audio []byte `json:"file"`
 }
 
 type GoogleDriveResponse struct {
 	ID             string `json:"id"`
 	Name           string `json:"name"`
 	WebContentLink string `json:"webContentLink"`
+	VideoBytes     []byte `json:"videoBytes"`
 }
 
 type MergeRequest struct {
-	VideoURL    string `json:"video_url"`
-	AudioURL    string `json:"audio_url"`
+	Video       []byte `json:"video_url"`
+	Audio       []byte `json:"audio_url"`
 	StartOffset int    `json:"start_offset"`
 }
 
