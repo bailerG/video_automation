@@ -10,6 +10,7 @@ import (
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/option"
+	"google.golang.org/genai"
 	"io"
 	"log"
 	"net/http"
@@ -55,12 +56,11 @@ func main() {
 // Initialize configuration
 func init() {
 	config = Config{
-		GeminiAPIKey:      getEnvOrDefault("GEMINI_API_KEY", "your-gemini-api-key"),
-		TTSAPIKey:         getEnvOrDefault("TTS_API_KEY", "your-tts-api-key"),
-		GoogleDriveAPIKey: getEnvOrDefault("GOOGLEDRIVE_API_KEY", "your-googledrive-api-key"),
-		MergeServiceURL:   getEnvOrDefault("MERGE_SERVICE_URL", "https://your-merge-service.com"),
-		RawVideoFileID:    getEnvOrDefault("RAW_VIDEO_FILE_ID", "YOUR_RAW_VIDEO_FILE_ID"),
-		OutputFolderID:    getEnvOrDefault("OUTPUT_FOLDER_ID", "YOUR_OUTPUT_FOLDER_ID"),
+		GeminiAPIKey:            getEnvOrDefault("GEMINI_API_KEY", ""),
+		TTSAPIKey:               getEnvOrDefault("TTS_API_KEY", ""),
+		GoogleDriveClientID:     getEnvOrDefault("DRIVE_CLIENT_ID", ""),
+		GoogleDriveClientSecret: getEnvOrDefault("DRIVE_CLIENT_SECRET", ""),
+		MergeServiceKey:         getEnvOrDefault("MERGER_KEY", ""),
 	}
 }
 
@@ -213,51 +213,35 @@ func GenStory() error {
 
 	prompt := fmt.Sprintf("Write a 60-second TikTok script that hooks viewers in the first 3 seconds and tells a compelling, shareable story about %s.", topic)
 
-	requestBody := GeminiRequest{
-		Contents: []struct {
-			Parts []struct {
-				Text string `json:"text"`
-			} `json:"parts"`
-		}{
-			{
-				Parts: []struct {
-					Text string `json:"text"`
-				}{
-					{Text: prompt},
-				},
-			},
+	ctx := context.Background()
+	client, err := genai.NewClient(
+		ctx,
+		&genai.ClientConfig{
+			APIKey:  config.GeminiAPIKey,
+			Backend: genai.BackendGeminiAPI,
 		},
-		GenerationConfig: struct {
-			Temperature     float64 `json:"temperature"`
-			MaxOutputTokens int     `json:"maxOutputTokens"`
-		}{
-			Temperature:     0.8,
-			MaxOutputTokens: 250,
-		},
-	}
-
-	headers := map[string]string{
-		"Content-Type": "application/json",
-	}
-
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-latest:generateContent?key=%s", config.GeminiAPIKey)
-	responseBody, err := makeHTTPRequest("POST", url, headers, requestBody)
+	)
 	if err != nil {
-		return fmt.Errorf("failed to generate story: %v", err)
+		log.Fatal(err)
 	}
 
-	var response GeminiResponse
-	if err = json.Unmarshal(responseBody, &response); err != nil {
-		return fmt.Errorf("failed to parse Gemini response: %v", err)
-	}
+	temperature := float32(0.8)
+	result, err := client.Models.GenerateContent(
+		ctx,
+		"gemini-2.5-pro",
+		genai.Text(prompt),
+		&genai.GenerateContentConfig{
+			Temperature:     &temperature,
+			MaxOutputTokens: int32(250),
+		},
+	)
 
-	if len(response.Candidates) == 0 || len(response.Candidates[0].Content.Parts) == 0 {
+	if result.Text() == "" {
 		return fmt.Errorf("no story generated")
 	}
 
-	currentStory = response.Candidates[0].Content.Parts[0].Text
-	fmt.Printf("✅ Generated story: %s\n", currentStory[:100]+"...")
-	return QAStory(currentStory)
+	fmt.Printf("✅ Generated story: %s\n", result.Text()[:100]+"...")
+	return QAStory(result.Text())
 }
 
 // QAStory function - evaluates the story quality
@@ -453,12 +437,12 @@ func FetchVideo(audioFile []byte) error {
 		return fmt.Errorf("failed to create Drive service: %v", err)
 	}
 
-	file, err := driveService.Files.Get(config.RawVideoFileID).Fields("id", "name", "webContentLink").Do()
+	file, err := driveService.Files.Download("/Content videos/Video playback from Yt5s.webm").Do()
 	if err != nil {
 		return fmt.Errorf("failed to fetch video from Google Drive: %v", err)
 	}
 
-	videoFile, err := file.VideoMediaMetadata.MarshalJSON()
+	videoFile, err := file.MarshalJSON()
 	fmt.Printf("✅ Video fetched successfully")
 	return MergeAV(audioFile, videoFile)
 }
@@ -467,29 +451,74 @@ func FetchVideo(audioFile []byte) error {
 func MergeAV(audioFile []byte, videoFile []byte) error {
 	fmt.Println("🔧 Merging audio and video...")
 
-	requestBody := MergeRequest{
-		Video:       audioFile,
-		Audio:       videoFile,
-		StartOffset: 0,
+	requestBody := map[string]interface{}{
+		"timeline": map[string]interface{}{
+			"tracks": []interface{}{
+				map[string]interface{}{
+					"clips": []interface{}{
+						map[string]interface{}{
+							"asset": map[string]interface{}{
+								"type": "caption",
+								"src":  "alias://voiceover",
+								"font": map[string]interface{}{
+									"color":      "#ffffff",
+									"family":     "Montserrat ExtraBold",
+									"size":       30,
+									"lineHeight": 0.8,
+								},
+								"margin": map[string]interface{}{
+									"top": 0.25,
+								},
+							},
+							"start":  0,
+							"length": "end",
+						},
+					},
+				},
+				map[string]interface{}{
+					"clips": []interface{}{
+						map[string]interface{}{
+							"alias": "voiceover",
+							"asset": map[string]interface{}{
+								"type":  "text-to-speech",
+								"text":  "Hello!",
+								"voice": "Matthew",
+							},
+							"start":  0,
+							"length": "auto",
+						},
+					},
+				},
+			},
+		},
+		"output": map[string]interface{}{
+			"format": "mp4",
+			"size": map[string]interface{}{
+				"width":  1280,
+				"height": 720,
+			},
+		},
 	}
 
 	headers := map[string]string{
-		"Authorization": "Bearer " + config.TTSAPIKey, // Assuming same API key
-		"Content-Type":  "application/json",
+		"Content-Type": "application/json",
+		"x-api-key":    "MtEwdwLp03sSDDZ05FYezjPbqA7veoffBfPfjm6B",
+		// Add your Shotstack API key if required, e.g. "x-api-key": config.ShotstackAPIKey
 	}
 
-	responseBody, err := makeHTTPRequest("POST", config.MergeServiceURL+"/merge", headers, requestBody)
+	responseBody, err := makeHTTPRequest("POST", "https://api.shotstack.io/edit/stage/render", headers, requestBody)
 	if err != nil {
 		return fmt.Errorf("failed to merge audio and video: %v", err)
 	}
 
-	var response MergeResponse
+	var response map[string]interface{}
 	if err = json.Unmarshal(responseBody, &response); err != nil {
-		return fmt.Errorf("failed to parse merge response: %v", err)
+		return fmt.Errorf("failed to parse Shotstack response: %v", err)
 	}
 
-	fmt.Printf("✅ Audio/Video merge completed: %s\n", response.OutputURL)
-	return FinalQA(response.OutputURL)
+	fmt.Printf("✅ Audio/Video merge request sent. Response: %v\n", response)
+	// You may want to poll for the render status and get the final video URL here.
+	return nil
 }
 
 // FinalQA function - final quality assessment
@@ -576,7 +605,7 @@ func SaveFinal(finalVideoURL string) error {
 
 	fileMetadata := &drive.File{
 		Name:     fileName,
-		Parents:  []string{config.OutputFolderID},
+		Parents:  []string{"/wtv/"},
 		MimeType: "video/mp4",
 	}
 
@@ -593,12 +622,11 @@ func SaveFinal(finalVideoURL string) error {
 
 // Config Configuration struct for API connections
 type Config struct {
-	GeminiAPIKey      string
-	TTSAPIKey         string
-	GoogleDriveAPIKey string
-	MergeServiceURL   string
-	RawVideoFileID    string
-	OutputFolderID    string
+	GeminiAPIKey            string
+	TTSAPIKey               string
+	GoogleDriveClientID     string
+	GoogleDriveClientSecret string
+	MergeServiceKey         string
 }
 
 // GeminiRequest Request structures for Gemini API calls
